@@ -7,16 +7,76 @@ My MCP Server
 对外通过 MCP 协议暴露工具，对内通过 HTTP/SSE 调用后端业务 API。
 整体分两层：
   - Client 类：封装后端 REST/SSE 调用（API 客户端层）
-  - @mcp_tool 装饰的函数：把能力暴露给 LLM（协议适配层）
+  - @mcp.tool() 装饰的函数：把能力暴露给 LLM（协议适配层）
 """
 
+import secrets    # 用于 secrets.compare_digest 做防时序攻击的 token 比较
 import threading  # 用于 threading.local 实现线程本地存储
 import json       # 解析 SSE 事件中的 JSON 数据
 import os         # 读取环境变量（如鉴权 token）
-import requests   # HTTP 客户端库
+from typing import Any, Dict
 
+import requests   # HTTP 客户端库
+from mcp.server import MCPServer
 from requests.exceptions import RequestException
 from upload_paths import set_active_transport  # 记录当前使用的传输方式（stdio/sse/http）
+
+# ===================== 配置 =====================
+BASE_URL = os.getenv("WEKNORA_BASE_URL", "http://localhost:8080/api/v1")  # 后端服务地址
+API_KEY = os.getenv("WEKNORA_API_KEY", "")  # 后端 API 密钥
+# SSE 读取间隔超时（秒），LLM 响应可能较慢，默认 300s
+CHAT_TIMEOUT = int(os.getenv("WEKNORA_CHAT_TIMEOUT", "300"))
+# 单个 SSE 事件允许累积的最大字节数，防止异常流撑爆内存
+MAX_BYTES = 8 * 1024 * 1024
+# SSE 传输的消息回传路径（MCP 协议约定）
+SSE_MESSAGE_PATH = "/sse/messages/"
+# Streamable HTTP 是否无状态（无状态模式更易于水平扩展）
+STREAMABLE_HTTP_STATELESS = True
+
+
+class MCPAuth:
+    """ASGI 鉴权中间件：包裹在 MCP 应用外面，校验共享密钥 token
+
+    客户端需在请求头中携带以下任一凭证：
+      Authorization: Bearer <token>
+      X-MCP-Auth-Token: <token>
+    """
+
+    def __init__(self, app, token: str):
+        self.app = app      # 被包装的内层 ASGI 应用
+        self.token = token
+
+    async def __call__(self, scope, receive, send):
+        # 非 HTTP 消息（如 lifespan 启动/关闭事件）没有请求头，直接透传
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # ASGI 头为字节串列表，统一转成小写 str 字典便于查找
+        headers = {
+            k.decode("latin-1").lower(): v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+        }
+        provided = ""
+        auth = headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            provided = auth[7:].strip()
+        elif "x-mcp-auth-token" in headers:
+            provided = headers["x-mcp-auth-token"]
+
+        # compare_digest 防止时序侧信道攻击
+        if not provided or not secrets.compare_digest(provided, self.token):
+            body = b'{"error":"unauthorized"}'
+            await send({
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [[b"content-type", b"application/json"]],
+            })
+            await send({"type": "http.response.body", "body": body})
+            return
+
+        # 鉴权通过，转交内层应用继续处理
+        await self.app(scope, receive, send)
 
 
 class Client:
@@ -88,11 +148,11 @@ class Client:
             )
             response.raise_for_status()
 
-            asw_chunks: list = []        # 累积所有 answer 片段，最后拼接成完整回答
-            ref: list = []               # 引用列表
-            debug: list = []             # 调试事件轨迹
-            content_line: list[str] = [] # 当前事件尚未结束的所有 data 行
-            content_bytes = 0            # 当前事件累计字节数（用于超限防护）
+            asw_chunks: list = []         # 累积所有 answer 片段，最后拼接成完整回答
+            ref: list = []                # 引用列表
+            debug: list = []              # 调试事件轨迹
+            content_lines: list[str] = [] # 当前事件尚未结束的所有 data 行
+            content_bytes = 0             # 当前事件累计字节数（用于超限防护）
 
             # with 确保 break/异常时连接也能归还连接池
             with response:
@@ -102,7 +162,7 @@ class Client:
                         line = line.decode("utf-8")
                     if line:
                         # 非空行：按 "字段名: 值" 拆分，只处理 data 字段
-                        field, _, value = line.partition(": ")
+                        field, _, value = line.partition(":")
                         if field == "data":
                             if value.startswith(" "):
                                 # 去掉第一个空格（SSE 规范：冒号后至多去掉一个前导空格）
@@ -113,11 +173,11 @@ class Client:
                                 raise RequestException(
                                     f"SSE事件超过最大字节数: {MAX_BYTES}"
                                 )
-                            content_line.append(value)
+                            content_lines.append(value)
                         # 非 data 字段（event/id/retry/注释等）直接忽略
                         continue
                     # 空行 = 一个事件结束：没有累积 data 的空帧直接跳过
-                    if not content_line:
+                    if not content_lines:
                         continue
                     # 多行 data 用 \n 拼接成完整 JSON 再解析
                     payload = "\n".join(content_lines)
@@ -138,9 +198,9 @@ class Client:
                         chunk = event_data.get("content", "")
                         if chunk:
                             asw_chunks.append(chunk)
-                    elif response_type == "reference":
-                        # 引用：整体覆盖（取最新一次）
-                        ref = event_data.get("reference", "") or []
+                    elif response_type == "references":
+                        # 引用：整体覆盖（取最新一次），与后端字段名 knowledge_references 对齐
+                        ref = event_data.get("knowledge_references") or []
                     elif response_type == "error":
                         # 服务端报错：立即抛异常终止
                         raise RequestException(
@@ -153,7 +213,7 @@ class Client:
             # EOF 处没有空行收尾的残余数据按 SSE 规范直接丢弃
             return {
                 "answer": "".join(asw_chunks),  # 拼接所有片段得到完整回答
-                "reference": ref,
+                "references": ref,
                 "debug": debug,
             }
         except requests.exceptions.RequestException as e:
@@ -161,7 +221,7 @@ class Client:
 
     def chat(self, session_id: str, query: str) -> Dict[str, Any]:
         """聊天接口：向指定会话发送问题，消费 SSE 流并返回组装结果"""
-        body = Dict[str, Any] = {"query": query}
+        body: Dict[str, Any] = {"query": query}
         result = self._sse_stream(
             f"{self.url}/chat/{session_id}",
             body
@@ -175,12 +235,13 @@ class Client:
 # docstring 作为工具描述展示给 LLM
 mcp = MCPServer("server_name", version="v1")
 # 初始化后端 API 客户端（全局单例，供各工具函数使用）
-client = Client(BASE_URL, "key")
+client = Client(BASE_URL, API_KEY)
 
 
-# 注册工具：@mcp_tool() 把普通函数暴露为 LLM 可调用的 MCP 工具
-@mcp_tool()
+# 注册工具：@mcp.tool() 把普通函数暴露为 LLM 可调用的 MCP 工具
+@mcp.tool()
 def queryForExample(query: str) -> Dict[str, Any]:
+    """查询示例：把 query 透传给后端查询接口并返回结果。"""
     return client.queryForExample(query)
 
 
